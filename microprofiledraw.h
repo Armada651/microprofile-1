@@ -31,8 +31,17 @@
 #define MICROPROFILEDRAW_API
 #endif
 
+#ifndef MICROPROFILEDRAW_GL
+#define MICROPROFILEDRAW_GL 1
+#endif
+
 #if MICROPROFILEDRAW_ENABLED
+#if MICROPROFILEDRAW_GL
 MICROPROFILEDRAW_API void MicroProfileDrawInitGL();
+#endif
+#if MICROPROFILEDRAW_D3D11
+MICROPROFILEDRAW_API void MicroProfileDrawInitD3D11(struct ID3D11DeviceContext* pContext);
+#endif
 
 MICROPROFILEDRAW_API void MicroProfileRender(uint32_t nWidth, uint32_t nHeight, float fScale);
 
@@ -56,6 +65,24 @@ struct MicroProfileDrawCommand
 	uint32_t nNumVertices;
 };
 
+enum MicroProfileRenderer
+{
+	MicroProfileOpenGL,
+	MicroProfileD3D11,
+};
+
+enum MicroProfileShader
+{
+	MicroProfileVertexShader,
+	MicroProfileFragmentShader,
+};
+
+enum MicroProfileCommand
+{
+	MicroProfileLines,
+	MicroProfileTriangles,
+};
+
 struct MicroProfileDrawContext
 {
 	enum
@@ -65,7 +92,9 @@ struct MicroProfileDrawContext
 	};
 
 	bool bInitialized;
+	MicroProfileRenderer eRenderer;
 
+#if MICROPROFILEDRAW_GL
 	GLuint nVAO;
 	GLuint nVertexBuffer;
 	GLuint nProgram;
@@ -75,6 +104,27 @@ struct MicroProfileDrawContext
 	int nAttributeColor;
 	int nAttributeTexture;
 	int nUniformProjectionMatrix;
+#endif
+
+#if MICROPROFILEDRAW_D3D11
+	ID3D11DeviceContext* pContext;
+
+	struct
+	{
+		ID3D11Buffer* pVertexBuffer;
+		ID3D11VertexShader* pVertexShader;
+		ID3D11PixelShader* pPixelShader;
+		ID3D11ShaderResourceView* pView;
+		ID3D11InputLayout* pLayout;
+		ID3D11BlendState* pBlend;
+		ID3D11DepthStencilState* pDepthStencil;
+		ID3D11RasterizerState* pRasterizer;
+		ID3D11Buffer* pConstantProjectionMatrix;
+
+		float BlendFactor[4];
+		UINT SampleMask, StencilRef, Stride, Offset;
+	} State[2];
+#endif
 
 	uint32_t nVertexPos;
 	uint32_t nCommandPos;
@@ -94,6 +144,9 @@ MicroProfileDrawContext g_MicroProfileDraw;
 #define FONT_TEX_Y 9
 #define FONT_SIZE (FONT_TEX_X*FONT_TEX_Y * 4)
 
+#define TOSTRING(s) #s
+#define STRINGIZE(s) TOSTRING(s)
+
 namespace
 {
 	extern const uint8_t g_MicroProfileFont[];
@@ -104,28 +157,60 @@ namespace
 
 	extern const char g_MicroProfileVertexShader_150[];
 	extern const char g_MicroProfileFragmentShader_150[];
+
+	extern const char g_MicroProfileVertexShader_hlsl[];
+	extern const char g_MicroProfileFragmentShader_hlsl[];
 }
 
-bool MicroProfileCompileShader(GLuint* pnHandle, int nType, const char* pShader)
+bool MicroProfileCompileShader(void* pnHandle, int nType, const char* pShader)
 {
-	*pnHandle = glCreateShader(nType);
-	glShaderSource(*pnHandle, 1, &pShader, 0);
-	glCompileShader(*pnHandle);
-
-	GLint compiled = 0;
-	glGetShaderiv(*pnHandle, GL_COMPILE_STATUS, &compiled);
-
-	if(!compiled)
+#if MICROPROFILEDRAW_GL
+	if (g_MicroProfileDraw.eRenderer == MicroProfileOpenGL)
 	{
-		char temp[4096];
-		glGetShaderInfoLog(*pnHandle, 4096, NULL, temp);
-		printf("SHADER FAILED TO COMPILE:\n%s\n", temp);
-		return false;
-	}
+		GLuint nHandle = glCreateShader(nType == MicroProfileVertexShader ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER);
+		glShaderSource(nHandle, 1, &pShader, 0);
+		glCompileShader(nHandle);
 
-	return true;
+		GLint compiled = 0;
+		glGetShaderiv(nHandle, GL_COMPILE_STATUS, &compiled);
+
+		if (!compiled)
+		{
+			char temp[4096];
+			glGetShaderInfoLog(nHandle, 4096, NULL, temp);
+			printf("SHADER FAILED TO COMPILE:\n%s\n", temp);
+			return false;
+		}
+
+		*(GLuint*)pnHandle = nHandle;
+		return true;
+	}
+#endif
+
+#if MICROPROFILEDRAW_D3D11
+	if (g_MicroProfileDraw.eRenderer == MicroProfileD3D11)
+	{
+		ID3DBlob* pError;
+		HRESULT hr = D3DCompile(pShader, strlen(pShader) + 1,
+			NULL, NULL, NULL, "main",
+			nType == MicroProfileVertexShader ? "vs_5_0" : "ps_5_0",
+			0, 0, (ID3DBlob**)pnHandle, &pError);
+
+		if (pError)
+		{
+			printf("SHADER FAILED TO COMPILE:\n%s\n", (char*)pError->GetBufferPointer());
+			pError->Release();
+			return false;
+		}
+
+		return SUCCEEDED(hr);
+	}
+#endif
+
+	return false;
 }
 
+#if MICROPROFILEDRAW_GL
 bool MicroProfileLinkProgram(GLuint* pnHandle, GLuint nVertexShader, GLuint nFragmentShader)
 {
 	*pnHandle = glCreateProgram();
@@ -152,6 +237,7 @@ void MicroProfileDrawInitGL()
 	MicroProfileDrawContext& S = g_MicroProfileDraw;
 
 	MP_ASSERT(!S.bInitialized);
+	S.eRenderer = MicroProfileOpenGL;
 
 	const GLubyte* pGLVersion = glGetString(GL_VERSION);
 	const GLubyte* pGLSLVersion = glGetString(GL_SHADING_LANGUAGE_VERSION);
@@ -170,11 +256,11 @@ void MicroProfileDrawInitGL()
 		S.nVAO = 0;
 
 	GLuint nVertexShader;
-	if(!MicroProfileCompileShader(&nVertexShader, GL_VERTEX_SHADER, nGLSLVersion >= 150 ? g_MicroProfileVertexShader_150 : g_MicroProfileVertexShader_110))
+	if(!MicroProfileCompileShader(&nVertexShader, MicroProfileVertexShader, nGLSLVersion >= 150 ? g_MicroProfileVertexShader_150 : g_MicroProfileVertexShader_110))
 		return;
 
 	GLuint nFragmentShader;
-	if(!MicroProfileCompileShader(&nFragmentShader, GL_FRAGMENT_SHADER, nGLSLVersion >= 150 ? g_MicroProfileFragmentShader_150 : g_MicroProfileFragmentShader_110))
+	if(!MicroProfileCompileShader(&nFragmentShader, MicroProfileFragmentShader, nGLSLVersion >= 150 ? g_MicroProfileFragmentShader_150 : g_MicroProfileFragmentShader_110))
 		return;
 
 	if(!MicroProfileLinkProgram(&S.nProgram, nVertexShader, nFragmentShader))
@@ -185,7 +271,7 @@ void MicroProfileDrawInitGL()
 	S.nAttributeTexture = glGetAttribLocation(S.nProgram, "TCIn");
 
 	S.nUniformProjectionMatrix = glGetUniformLocation(S.nProgram, "ProjectionMatrix");
-
+	
 	glUseProgram(S.nProgram);
 	glUniform1i(glGetUniformLocation(S.nProgram, "Texture"), 0);
 	glUniform1f(glGetUniformLocation(S.nProgram, "RcpFontHeight"), 1.f / FONT_TEX_Y);
@@ -218,6 +304,141 @@ void MicroProfileDrawInitGL()
 
 	S.bInitialized = true;
 }
+#endif
+
+#if MICROPROFILEDRAW_D3D11
+void MicroProfileDrawInitD3D11(ID3D11DeviceContext* pContext)
+{
+	MicroProfileDrawContext& S = g_MicroProfileDraw;
+
+	MP_ASSERT(!S.bInitialized);
+	S.eRenderer = MicroProfileD3D11;
+	S.pContext = pContext;
+
+	ID3D11Device* pDevice;
+	pContext->GetDevice(&pDevice);
+
+	D3D11_BUFFER_DESC bufferDesc;
+	bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+	bufferDesc.ByteWidth = sizeof(S.nVertices);
+	bufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+	bufferDesc.CPUAccessFlags = 0;
+	bufferDesc.MiscFlags = 0;
+	pDevice->CreateBuffer(&bufferDesc, NULL, &S.State[0].pVertexBuffer);
+
+	ID3DBlob* pVertexCode;
+	if (!MicroProfileCompileShader(&pVertexCode, MicroProfileVertexShader, g_MicroProfileVertexShader_hlsl))
+		return;
+
+	ID3DBlob* pPixelCode;
+	if (!MicroProfileCompileShader(&pPixelCode, MicroProfileFragmentShader, g_MicroProfileFragmentShader_hlsl))
+		return;
+
+	pDevice->CreateVertexShader(pVertexCode->GetBufferPointer(), pVertexCode->GetBufferSize(), NULL, &S.State[0].pVertexShader);
+	pDevice->CreatePixelShader(pPixelCode->GetBufferPointer(), pPixelCode->GetBufferSize(), NULL, &S.State[0].pPixelShader);
+
+	D3D11_INPUT_ELEMENT_DESC elements[] = {
+		{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		{ "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+	};
+	pDevice->CreateInputLayout(elements, sizeof(elements) / sizeof(D3D11_INPUT_ELEMENT_DESC),
+		pVertexCode->GetBufferPointer(), pVertexCode->GetBufferSize(), &S.State[0].pLayout);
+
+	pVertexCode->Release();
+	pPixelCode->Release();
+
+	bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+	bufferDesc.ByteWidth = sizeof(float) * 16;
+	bufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+	bufferDesc.CPUAccessFlags = 0;
+	bufferDesc.MiscFlags = 0;
+	pDevice->CreateBuffer(&bufferDesc, NULL, &S.State[0].pConstantProjectionMatrix);
+
+	uint32_t* pUnpacked = (uint32_t*)alloca(FONT_SIZE);
+	int idx = 0;
+	int end = FONT_TEX_X * FONT_TEX_Y / 8;
+	for (int i = 0; i < end; i++)
+	{
+		unsigned char pValue = g_MicroProfileFont[i];
+		for (int j = 0; j < 8; ++j)
+		{
+			pUnpacked[idx++] = pValue & 0x80 ? (uint32_t)-1 : 0;
+			pValue <<= 1;
+		}
+	}
+
+	pUnpacked[idx - 1] = 0xffffffff;
+
+	D3D11_SUBRESOURCE_DATA initialData;
+	initialData.pSysMem = &pUnpacked[0];
+	initialData.SysMemPitch = FONT_TEX_X * 4;
+	initialData.SysMemSlicePitch = 0;
+
+	ID3D11Texture2D* pTexture;
+	D3D11_TEXTURE2D_DESC texDesc;
+	texDesc.Width = FONT_TEX_X;
+	texDesc.Height = FONT_TEX_Y;
+	texDesc.MipLevels = 1;
+	texDesc.ArraySize = 1;
+	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	texDesc.SampleDesc.Count = 1;
+	texDesc.SampleDesc.Quality = 0;
+	texDesc.Usage = D3D11_USAGE_IMMUTABLE;
+	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	texDesc.CPUAccessFlags = 0;
+	texDesc.MiscFlags = 0;
+	pDevice->CreateTexture2D(&texDesc, &initialData, &pTexture);
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc;
+	viewDesc.Texture2D.MipLevels = 1;
+	viewDesc.Texture2D.MostDetailedMip = 0;
+	pDevice->CreateShaderResourceView(pTexture, &viewDesc, &S.State[0].pView);
+	pTexture->Release();
+
+	D3D11_BLEND_DESC blendDesc;
+	blendDesc.AlphaToCoverageEnable = false;
+	blendDesc.IndependentBlendEnable = false;
+	blendDesc.RenderTarget[0].BlendEnable = true;
+	blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+	blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+	blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+	blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+	blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+	blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+	blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+	pDevice->CreateBlendState(&blendDesc, &S.State[0].pBlend);
+
+	D3D11_DEPTH_STENCIL_DESC depthDesc;
+	depthDesc.DepthEnable = false;
+	depthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+	depthDesc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+	depthDesc.StencilEnable = false;
+	depthDesc.StencilReadMask = 0;
+	depthDesc.StencilWriteMask = 0;
+	depthDesc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+	depthDesc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+	depthDesc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+	depthDesc.FrontFace.StencilFunc = D3D11_COMPARISON_NEVER;
+	depthDesc.BackFace = depthDesc.FrontFace;
+	pDevice->CreateDepthStencilState(&depthDesc, &S.State[0].pDepthStencil);
+
+	D3D11_RASTERIZER_DESC rastDesc;
+	rastDesc.FillMode = D3D11_FILL_SOLID;
+	rastDesc.CullMode = D3D11_CULL_NONE;
+	rastDesc.FrontCounterClockwise = true;
+	rastDesc.DepthBias = 0;
+	rastDesc.DepthBiasClamp = 0.f;
+	rastDesc.SlopeScaledDepthBias = 0.f;
+	rastDesc.DepthClipEnable = true;
+	rastDesc.ScissorEnable = false;
+	rastDesc.MultisampleEnable = false;
+	rastDesc.AntialiasedLineEnable = false;
+	pDevice->CreateRasterizerState(&rastDesc, &S.State[0].pRasterizer);
+
+	S.bInitialized = true;
+}
+#endif
 
 void MicroProfileBeginDraw(uint32_t nWidth, uint32_t nHeight, float* pfProjection)
 {
@@ -229,31 +450,68 @@ void MicroProfileBeginDraw(uint32_t nWidth, uint32_t nHeight, float* pfProjectio
 	if (!S.bInitialized)
 		return;
 
-	glEnable(GL_BLEND);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	glDisable(GL_DEPTH_TEST);
-	glDisable(GL_CULL_FACE);
+#if MICROPROFILEDRAW_GL
+	if (S.eRenderer == MicroProfileOpenGL)
+	{
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_CULL_FACE);
 
-	if (S.nVAO)
-		glBindVertexArray(S.nVAO);
+		if (S.nVAO)
+			glBindVertexArray(S.nVAO);
 
-	glUseProgram(S.nProgram);
-	glUniformMatrix4fv(S.nUniformProjectionMatrix, 1, 0, pfProjection);
+		glUseProgram(S.nProgram);
+		glUniformMatrix4fv(S.nUniformProjectionMatrix, 1, 0, pfProjection);
 
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, S.nTexture);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, S.nTexture);
 
-	glBindBuffer(GL_ARRAY_BUFFER, S.nVertexBuffer);
+		glBindBuffer(GL_ARRAY_BUFFER, S.nVertexBuffer);
 
-	int nStride = sizeof(MicroProfileDrawVertex);
+		int nStride = sizeof(MicroProfileDrawVertex);
 
-	glVertexAttribPointer(S.nAttributePosition, 2, GL_FLOAT, 0, nStride, (void*)(offsetof(MicroProfileDrawVertex, nX)));
-	glVertexAttribPointer(S.nAttributeColor, 4, GL_UNSIGNED_BYTE, GL_TRUE, nStride, (void*)(offsetof(MicroProfileDrawVertex, nColor)));
-	glVertexAttribPointer(S.nAttributeTexture, 2, GL_FLOAT, 0, nStride, (void*)(offsetof(MicroProfileDrawVertex, fU)));
+		glVertexAttribPointer(S.nAttributePosition, 2, GL_FLOAT, 0, nStride, (void*)(offsetof(MicroProfileDrawVertex, nX)));
+		glVertexAttribPointer(S.nAttributeColor, 4, GL_UNSIGNED_BYTE, GL_TRUE, nStride, (void*)(offsetof(MicroProfileDrawVertex, nColor)));
+		glVertexAttribPointer(S.nAttributeTexture, 2, GL_FLOAT, 0, nStride, (void*)(offsetof(MicroProfileDrawVertex, fU)));
 
-	glEnableVertexAttribArray(S.nAttributePosition);
-	glEnableVertexAttribArray(S.nAttributeColor);
-	glEnableVertexAttribArray(S.nAttributeTexture);
+		glEnableVertexAttribArray(S.nAttributePosition);
+		glEnableVertexAttribArray(S.nAttributeColor);
+		glEnableVertexAttribArray(S.nAttributeTexture);
+	}
+#endif
+
+#if MICROPROFILEDRAW_D3D11
+	if (S.eRenderer == MicroProfileD3D11)
+	{
+		S.pContext->OMGetBlendState(&S.State[1].pBlend, S.State[1].BlendFactor, &S.State[1].SampleMask);
+		S.pContext->OMGetDepthStencilState(&S.State[1].pDepthStencil, &S.State[1].StencilRef);
+		S.pContext->RSGetState(&S.State[1].pRasterizer);
+
+		S.pContext->IAGetVertexBuffers(0, 1, &S.State[1].pVertexBuffer, &S.State[1].Stride, &S.State[1].Offset);
+		S.pContext->VSGetShader(&S.State[1].pVertexShader, NULL, NULL);
+		S.pContext->VSGetConstantBuffers(0, 1, &S.State[1].pConstantProjectionMatrix);
+		S.pContext->PSGetShader(&S.State[1].pPixelShader, NULL, 0);
+		S.pContext->PSGetShaderResources(0, 1, &S.State[1].pView);
+		S.pContext->IAGetInputLayout(&S.State[1].pLayout);
+
+		S.pContext->OMSetBlendState(S.State[0].pBlend, S.State[0].BlendFactor, S.State[0].SampleMask);
+		S.pContext->OMSetDepthStencilState(S.State[0].pDepthStencil, 0);
+		S.pContext->RSSetState(S.State[0].pRasterizer);
+
+		D3D11_MAPPED_SUBRESOURCE map;
+		S.pContext->Map(S.State[0].pConstantProjectionMatrix, 0, D3D11_MAP_WRITE, 0, &map);
+		memcpy(map.pData, pfProjection, sizeof(float) * 16);
+		S.pContext->Unmap(S.State[0].pConstantProjectionMatrix, 0);
+
+		S.pContext->IASetVertexBuffers(0, 1, &S.State[0].pVertexBuffer, &S.State[0].Stride, &S.State[0].Offset);
+		S.pContext->VSSetShader(S.State[0].pVertexShader, NULL, 0);
+		S.pContext->VSSetConstantBuffers(0, 1, &S.State[0].pConstantProjectionMatrix);
+		S.pContext->PSSetShader(S.State[0].pPixelShader, NULL, 0);
+		S.pContext->PSSetShaderResources(0, 1, &S.State[0].pView);
+		S.pContext->IASetInputLayout(S.State[0].pLayout);
+	}
+#endif
 
 	S.nVertexPos = 0;
 	S.nCommandPos = 0;
@@ -295,14 +553,45 @@ void MicroProfileFlush()
 
 	MICROPROFILE_SCOPEI("MicroProfile", "Flush", 0xffff3456);
 
-	glBufferSubData(GL_ARRAY_BUFFER, 0, S.nVertexPos * sizeof(MicroProfileDrawVertex), S.nVertices);
+#if MICROPROFILEDRAW_GL
+	if (S.eRenderer == MicroProfileOpenGL)
+	{
+		glBufferSubData(GL_ARRAY_BUFFER, 0, S.nVertexPos * sizeof(MicroProfileDrawVertex), S.nVertices);
+	}
+#endif
+
+#if MICROPROFILEDRAW_D3D11
+	if (S.eRenderer == MicroProfileD3D11)
+	{
+		D3D11_MAPPED_SUBRESOURCE map;
+		S.pContext->Map(S.State[0].pVertexBuffer, 0, D3D11_MAP_WRITE, 0, &map);
+		memcpy(map.pData, S.nVertices, S.nVertexPos * sizeof(MicroProfileDrawVertex));
+		S.pContext->Unmap(S.State[0].pVertexBuffer, 0);
+	}
+#endif
 
 	int nOffset = 0;
 
 	for(int i = 0; i < int(S.nCommandPos); ++i)
 	{
 		int nCount = S.nCommands[i].nNumVertices;
-		glDrawArrays(S.nCommands[i].nCommand, nOffset, nCount);
+
+#if MICROPROFILEDRAW_GL
+		if (S.eRenderer == MicroProfileOpenGL)
+		{
+			glDrawArrays(S.nCommands[i].nCommand == MicroProfileLines ? GL_LINES : GL_TRIANGLES, nOffset, nCount);
+		}
+#endif
+
+#if MICROPROFILEDRAW_D3D11
+		if (S.eRenderer == MicroProfileD3D11)
+		{
+			S.pContext->IASetPrimitiveTopology(S.nCommands[i].nCommand == MicroProfileLines ?
+				D3D11_PRIMITIVE_TOPOLOGY_LINELIST : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			S.pContext->Draw(nCount, nOffset);
+		}
+#endif
+
 		nOffset += nCount;
 	}
 
@@ -348,17 +637,38 @@ void MicroProfileEndDraw()
 
 	MicroProfileFlush();
 
-	glDisableVertexAttribArray(S.nAttributePosition);
-	glDisableVertexAttribArray(S.nAttributeColor);
-	glDisableVertexAttribArray(S.nAttributeTexture);
+#if MICROPROFILEDRAW_GL
+	if (S.eRenderer == MicroProfileOpenGL)
+	{
+		glDisableVertexAttribArray(S.nAttributePosition);
+		glDisableVertexAttribArray(S.nAttributeColor);
+		glDisableVertexAttribArray(S.nAttributeTexture);
 
-	glBindBuffer(GL_ARRAY_BUFFER, 0);
-	glUseProgram(0);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glUseProgram(0);
 
-	if (S.nVAO)
-		glBindVertexArray(0);
+		if (S.nVAO)
+			glBindVertexArray(0);
 
-	glDisable(GL_BLEND);
+		glDisable(GL_BLEND);
+	}
+#endif
+
+#if MICROPROFILEDRAW_D3D11
+	if (S.eRenderer == MicroProfileD3D11)
+	{
+		S.pContext->OMSetBlendState(S.State[1].pBlend, S.State[1].BlendFactor, S.State[1].SampleMask);
+		S.pContext->OMSetDepthStencilState(S.State[1].pDepthStencil, 0);
+		S.pContext->RSSetState(S.State[1].pRasterizer);
+
+		S.pContext->IASetVertexBuffers(0, 1, &S.State[1].pVertexBuffer, &S.State[1].Stride, &S.State[1].Offset);
+		S.pContext->VSSetShader(S.State[1].pVertexShader, NULL, 0);
+		S.pContext->VSSetConstantBuffers(0, 1, &S.State[1].pConstantProjectionMatrix);
+		S.pContext->PSSetShader(S.State[1].pPixelShader, NULL, 0);
+		S.pContext->PSSetShaderResources(0, 1, &S.State[1].pView);
+		S.pContext->IASetInputLayout(S.State[1].pLayout);
+	}
+#endif
 }
 
 void MicroProfileRender(uint32_t nWidth, uint32_t nHeight, float fScale)
@@ -378,7 +688,7 @@ void MicroProfileDrawText(int nX, int nY, uint32_t nColor, const char* pText, ui
 	float fY = (float)nY;
 	float fY2 = fY + (MICROPROFILE_TEXT_HEIGHT+1);
 
-	MicroProfileDrawVertex* pVertex = MicroProfilePushVertices(GL_TRIANGLES, 6 * nLen);
+	MicroProfileDrawVertex* pVertex = MicroProfilePushVertices(MicroProfileTriangles, 6 * nLen);
 	if (!pVertex) return;
 
 	const char* pStr = pText;
@@ -419,7 +729,7 @@ void MicroProfileDrawText(int nX, int nY, uint32_t nColor, const char* pText, ui
 }
 void MicroProfileDrawBox(int nX0, int nY0, int nX1, int nY1, uint32_t nColor, MicroProfileBoxType Type)
 {
-	MicroProfileDrawVertex* pVertex = MicroProfilePushVertices(GL_TRIANGLES, 6);
+	MicroProfileDrawVertex* pVertex = MicroProfilePushVertices(MicroProfileTriangles, 6);
 	if (!pVertex) return;
 
 	if(Type == MicroProfileBoxTypeFlat)
@@ -491,7 +801,7 @@ void MicroProfileDrawLine2D(uint32_t nVertices, float* pVertices, uint32_t nColo
 {
 	if(!nVertices) return;
 
-	MicroProfileDrawVertex* pVertex = MicroProfilePushVertices(GL_LINES, 2*(nVertices-1));
+	MicroProfileDrawVertex* pVertex = MicroProfilePushVertices(MicroProfileLines, 2*(nVertices-1));
 	nColor = ((nColor&0xff)<<16)|(nColor&0xff00ff00)|((nColor>>16)&0xff);
 	for(uint32_t i = 0; i < nVertices-1; ++i)
 	{
@@ -545,6 +855,24 @@ namespace
 			vec4 c0 = texture(Texture, TC.xy); \
 			vec4 c1 = texture(Texture, TC.xy + vec2(0.0, RcpFontHeight)); \
 			result = c0.w < 0.5 ? vec4(0, 0, 0, c1.w) : c0 * Color; \
+		} \
+	";
+
+	const char g_MicroProfileVertexShader_hlsl[] =
+		"float4x4 ProjectionMatrix; \
+		struct VS_INPUT { float3 Vertex : POSITION; float4 Color : COLOR; float2 TC : TEXCOORD; }; \
+		struct VS_OUTPUT { float4 Vertex : POSITION; float4 Color : COLOR; float2 TC : TEXCOORD; }; \
+		VS_OUTPUT main(const VS_INPUT In) { VS_OUTPUT Out; \
+			Out.Color = In.Color; Out.TC = In.TC; Out.Position = mul(float4(In.Vertex, 1.0), ProjectionMatrix); return Out; }";
+
+	const char g_MicroProfileFragmentShader_hlsl[] =
+		"SamplerState Sampler { Filter = MIN_MAG_MIP_POINT; AddressU = Clamp; AddressV = Clamp; }; \
+		Texture2D Texture; \
+		struct PS_INPUT { float2 TC : TEXCOORD; float4 Color : COLOR; }; \
+		float4 main(PS_INPUT In) { \
+			float4 c0 = Texture.Sample(Sampler, In.TC); \
+			float4 c1 = Texture.Sample(Sampler, In.TC + float2(0.0, 1.f / " STRINGIZE(FONT_TEX_Y) "));"
+			"return c0.w < 0.5 ? float4(0, 0, 0, c1.w) : c0 * In.Color; \
 		} \
 	";
 
